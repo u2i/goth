@@ -131,7 +131,21 @@ defmodule Goth do
   """
   @doc since: "1.3.0"
   def fetch(name, timeout \\ 5000) do
-    read_from_ets(name) || GenServer.call(registry_name(name), :fetch, timeout)
+    case read_from_ets(name) do
+      nil ->
+        Logger.debug("Token not found in ETS cache for #{inspect(name)}. Fetching new token.")
+        GenServer.call(registry_name(name), :fetch, timeout)
+
+      token ->
+        Logger.debug("Token found in ETS cache for #{inspect(name)}: #{inspect(token)}")
+
+        if token_expired?(token) do
+          Logger.debug("Cached token is expired. Fetching new token.")
+          GenServer.call(registry_name(name), :fetch, timeout)
+        else
+          {:ok, token}
+        end
+    end
   end
 
   @doc """
@@ -205,14 +219,62 @@ defmodule Goth do
 
   @impl true
   def handle_call(:fetch, _from, state) do
-    reply = read_from_ets(state.name) || fetch_and_schedule_refresh(state)
-    {:reply, reply, state}
+    scope = Map.get(state, :scope, "https://www.googleapis.com/auth/cloud-platform")
+
+    case read_from_ets(state.name) do
+      nil ->
+        Logger.debug("Token not found in ETS cache. Fetching new token.")
+        {:ok, token} = fetch_token(state, scope)
+        store_and_schedule_refresh(state, token)
+        {:reply, {:ok, token}, state}
+
+      token ->
+        if token_expired?(token) do
+          Logger.debug("Cached token is expired. Fetching new token.")
+          {:ok, new_token} = fetch_token(state, scope)
+          store_and_schedule_refresh(state, new_token)
+          {:reply, {:ok, new_token}, state}
+        else
+          Logger.debug("Using cached token.")
+          {:reply, {:ok, token}, state}
+        end
+    end
   end
 
-  defp fetch_and_schedule_refresh(state) do
-    with {:ok, token} <- Token.fetch(state) do
-      store_and_schedule_refresh(state, token)
-      {:ok, token}
+  defp fetch_token(state, scope) do
+    case state.source do
+      {:default, _} ->
+        Goth.Token.fetch(scope: scope)
+
+      {mod, fun} when is_atom(mod) and is_atom(fun) ->
+        apply(mod, fun, [])
+
+      fun when is_function(fun, 0) ->
+        fun.()
+
+      other ->
+        raise "Invalid token source: #{inspect(other)}"
+    end
+  end
+
+  defp token_expired?(token) do
+    current_time = System.os_time(:second)
+
+    case token do
+      %Token{expires: expires} when is_integer(expires) ->
+        result = expires <= current_time
+        Logger.debug("Token expiration check: expires=#{expires}, current_time=#{current_time}, expired?=#{result}")
+        result
+
+      %Token{expires: expires} ->
+        Logger.warn("Unexpected expires value in token: #{inspect(expires)}")
+        # Treat as expired if we can't determine
+        true
+
+      _ ->
+        Logger.warn("Unexpected token structure: #{inspect(token)}")
+        # Treat as expired if structure is unexpected
+        true
     end
   end
 
@@ -266,10 +328,16 @@ defmodule Goth do
   end
 
   defp store_and_schedule_refresh(state, token) do
+    Logger.debug("Storing token in ETS cache: #{inspect(token)}")
     put(state.name, token)
-    time_in_seconds = max(token.expires - System.os_time(:second) - state.refresh_before, 0)
 
-    Process.send_after(self(), :refresh, time_in_seconds * 1000)
+    time_in_seconds = max(token.expires - System.os_time(:second) - state.refresh_before, 0)
+    # Set a minimum refresh interval of 60 seconds
+    minimum_refresh_interval = 60
+    refresh_in = max(time_in_seconds, minimum_refresh_interval)
+
+    Logger.debug("Scheduling token refresh in #{refresh_in} seconds")
+    Process.send_after(self(), :refresh, refresh_in * 1000)
   end
 
   defp exp_backoff(retry_count) do

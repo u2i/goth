@@ -25,6 +25,8 @@ defmodule Goth.Token do
   @default_url "https://www.googleapis.com/oauth2/v4/token"
   @default_scopes ["https://www.googleapis.com/auth/cloud-platform"]
 
+  require Logger
+
   @doc """
   Fetch the token from the Google API using the given `config`.
 
@@ -261,14 +263,12 @@ defmodule Goth.Token do
         {:ok, audience} = Goth.Config.get(:audience)
         {:ok, subject_token_type} = Goth.Config.get(:subject_token_type)
         {:ok, credential_source} = Goth.Config.get(:credential_source)
-        {:ok, service_account_impersonation_url} = Goth.Config.get(:service_account_impersonation_url)
 
         credentials = %{
           "token_url" => url,
           "audience" => audience,
           "subject_token_type" => subject_token_type,
-          "credential_source" => credential_source,
-          "service_account_impersonation_url" => service_account_impersonation_url
+          "credential_source" => credential_source
         }
 
         request(%{config | source: {:workload_identity, credentials}})
@@ -360,6 +360,14 @@ defmodule Goth.Token do
 
     headers = [{"Content-Type", "application/x-www-form-urlencoded"}]
 
+    Logger.info("Retrieving subject token for workload identity")
+    subject_token = subject_token_from_credential_source(config, credential_source)
+
+    unless subject_token do
+      Logger.error("Subject token is empty")
+      raise "Subject token is empty"
+    end
+
     body =
       URI.encode_query(%{
         "audience" => audience,
@@ -367,11 +375,14 @@ defmodule Goth.Token do
         "requested_token_type" => "urn:ietf:params:oauth:token-type:access_token",
         "scope" => "https://www.googleapis.com/auth/cloud-platform",
         "subject_token_type" => subject_token_type,
-        "subject_token" => subject_token_from_credential_source(credential_source)
+        "subject_token" => subject_token
       })
 
+    Logger.info("Sending token exchange request to: #{inspect(token_url)}")
+    Logger.info("Token exchange request body: #{inspect(body)}")
     response = request(config.http_client, method: :post, url: token_url, headers: headers, body: body)
 
+    Logger.info("Token exchange response received: #{inspect(response)}")
     handle_workload_identity_response(response, config)
   end
 
@@ -390,8 +401,61 @@ defmodule Goth.Token do
     {url, audience}
   end
 
-  defp subject_token_from_credential_source(%{"file" => file, "format" => %{"type" => "text"}}) do
+  defp subject_token_from_credential_source(
+         config,
+         %{"file" => file, "format" => %{"type" => "text"}}
+       ) do
+    Logger.info("Reading subject token from file: #{inspect(file)}")
     File.read!(file)
+  end
+
+  defp subject_token_from_credential_source(
+         config,
+         %{
+           "format" => %{"subject_token_field_name" => field_name, "type" => "json"},
+           "url" => url
+         } = credential_source
+       ) do
+    headers =
+      credential_source
+      |> Map.get("headers", %{})
+      |> Enum.map(fn {k, v} -> {to_string(k), to_string(v)} end)
+
+    Logger.info("Requesting subject token from URL: #{inspect(url)}")
+    Logger.info("Using headers: #{inspect(headers)}")
+
+    response = request(config.http_client, method: :get, url: url, headers: headers, body: "")
+
+    case response do
+      {:ok, %{status: 200, body: body}} ->
+        Logger.info("Received response body: #{inspect(body)}")
+
+        case Jason.decode(body) do
+          {:ok, parsed_body} ->
+            token = Map.get(parsed_body, field_name)
+
+            unless token do
+              Logger.error("Field '#{field_name}' not found in response body.")
+              raise "Failed to fetch subject token: Field '#{field_name}' not found in response"
+            end
+
+            Logger.info("Retrieved subject token: #{inspect(token)}")
+            token
+
+          {:error, error} ->
+            Logger.error("Failed to parse response body: #{inspect(error)}")
+            raise "Failed to parse response body: #{inspect(error)}"
+        end
+
+      {:ok, %{status: status, body: body}} ->
+        Logger.error("Unexpected status #{status} from credential source")
+        Logger.error("Response body: #{inspect(body)}")
+        raise "Failed to fetch subject token: Received status #{status}"
+
+      {:error, error} ->
+        Logger.error("Failed to fetch subject token: #{inspect(error)}")
+        raise "Failed to fetch subject token: #{inspect(error)}"
+    end
   end
 
   defp handle_jwt_response({:ok, %{status: 200, body: body}}) do
@@ -404,41 +468,151 @@ defmodule Goth.Token do
          {:ok, %{status: 200, body: body}},
          %{source: {:workload_identity, credentials}} = config
        ) do
+    Logger.info("Handling successful workload identity response")
     url = Map.get(credentials, "service_account_impersonation_url")
-    %{"access_token" => token, "token_type" => type} = Jason.decode!(body)
+    Logger.info("Service account impersonation URL: #{inspect(url)}")
+    Logger.info("Full credentials: #{inspect(credentials)}")
+    Logger.info("Response body: #{inspect(body)}")
 
-    headers = [{"content-type", "text/json"}, {"Authorization", "#{type} #{token}"}]
-    body = Jason.encode!(%{scope: "https://www.googleapis.com/auth/cloud-platform"})
-    response = request(config.http_client, method: :post, url: url, headers: headers, body: body)
-
-    handle_response(response)
-  end
-
-  defp handle_workload_identity_response(response, _config), do: handle_response(response)
-
-  defp handle_response({:ok, %{status: 200, body: body}}) when is_map(body) do
-    {:ok, build_token(body)}
-  end
-
-  defp handle_response({:ok, %{status: 200, body: body}}) do
     case Jason.decode(body) do
-      {:ok, attrs} -> {:ok, build_token(attrs)}
-      {:error, reason} -> {:error, reason}
+      {:ok, decoded_body} ->
+        Logger.info("Successfully decoded response body: #{inspect(decoded_body)}")
+        token = Map.get(decoded_body, "access_token")
+        type = Map.get(decoded_body, "token_type")
+
+        cond do
+          is_nil(url) ->
+            Logger.warning("Service account impersonation URL is nil. Proceeding without impersonation.")
+            result = build_token(decoded_body)
+            Logger.info("Built token without impersonation: #{inspect(result)}")
+            {:ok, result}
+
+          is_nil(token) or is_nil(type) ->
+            Logger.error("Missing token or type in decoded body")
+            {:error, "Invalid response format from workload identity"}
+
+          true ->
+            Logger.warning("Preparing impersonation request")
+            headers = [{"content-type", "text/json"}, {"Authorization", "#{type} #{token}"}]
+            body = Jason.encode!(%{scope: "https://www.googleapis.com/auth/cloud-platform"})
+            Logger.warning("Sending impersonation request to: #{inspect(url)}")
+            Logger.warning("Impersonation request headers: #{inspect(headers)}")
+            Logger.warning("Impersonation request body: #{inspect(body)}")
+
+            response = request(config.http_client, method: :post, url: url, headers: headers, body: body)
+            Logger.info("Impersonation response received: #{inspect(response)}")
+            result = handle_response(response)
+            Logger.info("Handled impersonation response: #{inspect(result)}")
+            result
+        end
+
+      {:error, error} ->
+        Logger.error("Failed to parse workload identity response: #{inspect(error)}")
+        {:error, "Failed to parse workload identity response"}
     end
   end
 
-  defp handle_response({:ok, response}) do
-    message = """
-    unexpected status #{response.status} from Google
-
-    #{response.body}
-    """
-
-    {:error, RuntimeError.exception(message)}
+  defp handle_workload_identity_response({:ok, %{status: status, body: body}}, _config) do
+    Logger.error("Unexpected status #{status} from workload identity response")
+    Logger.error("Response body: #{inspect(body)}")
+    {:error, "Unexpected status from workload identity response"}
   end
 
-  defp handle_response({:error, exception}) do
-    {:error, exception}
+  defp handle_workload_identity_response({:error, error}, _config) do
+    Logger.error("Error in workload identity response: #{inspect(error)}")
+    {:error, "Error in workload identity response"}
+  end
+
+  defp build_token(%{"access_token" => token, "expires_in" => expires_in, "token_type" => type}) do
+    expires_in_int = if is_binary(expires_in), do: String.to_integer(expires_in), else: expires_in
+    expires = System.os_time(:second) + expires_in_int
+    Logger.info("build_token called with access_token, expires_in, and token_type. Expires set to: #{expires}")
+
+    %__MODULE__{
+      token: token,
+      type: type,
+      expires: expires,
+      scope: "https://www.googleapis.com/auth/cloud-platform"
+    }
+  end
+
+  # Add a new clause to handle the case when "expires_in" is not present
+  defp build_token(%{"access_token" => token, "token_type" => type}) do
+    # Default to 1 hour expiration
+    expires = System.os_time(:second) + 3600
+    Logger.info("build_token called with access_token and token_type, but no expires_in. Expires set to: #{expires}")
+
+    %__MODULE__{
+      token: token,
+      type: type,
+      expires: expires,
+      scope: "https://www.googleapis.com/auth/cloud-platform"
+    }
+  end
+
+  # New clause to handle the %{"count" => _, "value" => _} structure
+  defp build_token(%{"count" => count, "value" => value}) do
+    # Default to 1 hour expiration
+    expires = System.os_time(:second) + 3600
+    Logger.info("build_token called with count and value structure. Count: #{count}, Expires set to: #{expires}")
+
+    %__MODULE__{
+      expires: expires,
+      token: value,
+      type: "Bearer"
+    }
+  end
+
+  # Add a catch-all clause to log unexpected input
+  defp build_token(input) do
+    Logger.warning("build_token called with unexpected input: #{inspect(input)}")
+
+    %__MODULE__{
+      # Default to 1 hour expiration
+      expires: System.os_time(:second) + 3600,
+      token: "unexpected_input",
+      type: "Bearer"
+    }
+  end
+
+  defp handle_response({:ok, %{status: 200, body: body}}) when is_map(body) do
+    Logger.info("handle_response called with status 200 and body: #{inspect(body)}")
+
+    case body do
+      %{"value" => _} ->
+        Logger.info("Body contains 'value' key")
+        {:ok, build_token(body)}
+
+      _ ->
+        Logger.info("Body does not contain 'value' key")
+        {:ok, build_token(body)}
+    end
+  end
+
+  defp handle_response({:ok, %{status: 200, body: body}}) do
+    Logger.info("handle_response called with status 200 and body: #{inspect(body)}")
+
+    case Jason.decode(body) do
+      {:ok, attrs} ->
+        Logger.info("Successfully decoded JSON body")
+        {:ok, build_token(attrs)}
+
+      {:error, reason} ->
+        Logger.error("Failed to decode JSON body: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  defp handle_response({:ok, %{status: status, body: body}}) do
+    error_message = "Unexpected status #{status} from Google"
+    Logger.error(error_message)
+    Logger.error("Response body: #{inspect(body)}")
+    {:error, %{status: status, message: error_message, body: body}}
+  end
+
+  defp handle_response({:error, %{reason: reason} = error}) do
+    Logger.error("HTTP request failed: #{inspect(error)}")
+    {:error, %{reason: reason, message: "HTTP request failed"}}
   end
 
   defp jwt_encode(claims, %{"private_key" => private_key, "client_email" => client_email}) do
@@ -491,15 +665,44 @@ defmodule Goth.Token do
   end
 
   defp request({:finch, extra_options}, options) do
-    Goth.__finch__(options ++ extra_options)
+    Logger.info("Making Finch request with options: #{inspect(options)}")
+
+    case options[:url] do
+      nil ->
+        Logger.error("Attempted to make a Finch request with a nil URL")
+        {:error, "URL is nil"}
+
+      _ ->
+        result = Goth.__finch__(options ++ extra_options)
+        Logger.info("Finch request result: #{inspect(result)}")
+        result
+    end
   end
 
-  defp request({mod, _} = config, options) when is_atom(mod) do
-    Goth.HTTPClient.request(config, options[:method], options[:url], options[:headers], options[:body], [])
+  defp request({module, _} = config, options) when is_atom(module) do
+    Logger.info("Making HTTP request with module #{inspect(module)} and options: #{inspect(options)}")
+
+    case options[:url] do
+      nil ->
+        Logger.error("Attempted to make an HTTP request with a nil URL")
+        {:error, "URL is nil"}
+
+      _ ->
+        Goth.HTTPClient.request(config, options[:method], options[:url], options[:headers], options[:body], [])
+    end
   end
 
   defp request({fun, extra_options}, options) when is_function(fun, 1) do
-    fun.(options ++ extra_options)
+    Logger.info("Making custom HTTP request with options: #{inspect(options)}")
+
+    case options[:url] do
+      nil ->
+        Logger.error("Attempted to make a custom HTTP request with a nil URL")
+        {:error, "URL is nil"}
+
+      _ ->
+        fun.(options ++ extra_options)
+    end
   end
 
   # Everything below is deprecated.
